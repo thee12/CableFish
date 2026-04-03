@@ -1,27 +1,19 @@
 /*
  * analysis.h — Anomaly detection engine (public interface)
  *
- * Implements three rule-based detectors triggered once per packet:
+ * Phase 4 change: check_anomalies() now returns alert_type_t instead of void.
+ * The return value is used by parse.c to populate the alert field of the
+ * packet_record_t that gets written to the JSON/CSV output pipeline.
  *
- *   SYN_SCAN    — many TCP SYN packets from one source IP across any number
- *                 of flows, with few corresponding ACKs. Tracked per source IP
- *                 because a scanner probes many ports (many flows), so the
- *                 signal only appears when aggregated at the IP level.
+ * All three detectors remain active on every call; the return value is the
+ * highest-priority alert that fired (ALERT_NONE if nothing fired).
  *
- *   DNS_ANOMALY — either a single DNS query for an unusually long domain
- *                 (possible DNS tunnelling) or a high query rate from one
- *                 source (possible C2 or DGA). Both tracked per source IP.
+ * Priority order (highest first):
+ *   ALERT_HIGH_TRAFFIC > ALERT_SYN_SCAN > ALERT_DNS_ANOMALY_FREQ > ALERT_DNS_ANOMALY_LONG
  *
- *   HIGH_TRAFFIC — a single bidirectional flow whose byte total exceeds a
- *                  threshold (possible large transfer or data exfiltration).
- *                  Tracked per flow_entry_t.
- *
- * Alert spam is suppressed with per-IP and per-flow cooldown timestamps.
- * Sliding window counters reset when the current packet arrives outside the
- * previous window — O(1) per packet, no timers or full-table scans required.
- *
- * The ip_table_t (per-IP state) is owned and managed entirely within this
- * module. Callers only call analysis_init, analysis_free, and check_anomalies.
+ * Console alerts (printf) still fire for ALL detectors that trigger,
+ * regardless of which one is returned. The return value is only used to
+ * populate the log record — it does not suppress any console output.
  */
 
 #ifndef ANALYSIS_H
@@ -31,26 +23,27 @@
 
 /*
  * analysis_init — zero-initialise the ip_tracker hash table.
- * Must be called before check_anomalies.
  */
 void analysis_init(ip_table_t *tbl);
 
 /*
- * analysis_free — release all heap memory held by the ip_tracker table.
+ * analysis_free — release all heap memory in the ip_tracker table.
  */
 void analysis_free(ip_table_t *tbl);
 
 /*
- * check_anomalies — run all three detectors for one packet/flow update.
+ * check_anomalies — run all detectors for one packet/flow event.
  *
- * flow     — the flow entry already updated by flow_lookup_or_create.
- * pkt      — full packet metadata filled in by parse.c.
- * trackers — per-IP state table, allocated by the caller (main.c).
+ * Parameters:
+ *   flow     — flow entry already updated by flow_lookup_or_create
+ *   pkt      — full parsed packet metadata from parse.c
+ *   trackers — per-IP state table (owned by main.c, passed through)
  *
- * Each detector is independent; a single packet can trigger multiple alerts.
+ * Returns the highest-priority alert_type_t that fired, or ALERT_NONE.
+ * The caller (parse.c) stores this in the packet_record_t for logging.
  */
-void check_anomalies(flow_entry_t *flow,
-                     const packet_info_t *pkt,
-                     ip_table_t *trackers);
+alert_type_t check_anomalies(flow_entry_t        *flow,
+                             const packet_info_t *pkt,
+                             ip_table_t          *trackers);
 
 #endif /* ANALYSIS_H */

@@ -1,63 +1,89 @@
 /*
- * parse.c — Packet parsing implementation
+ * parse.c — Packet parsing and output pipeline integration
  *
- * Internal call chain (all functions except parse_dispatch are static):
+ * Phase 4 additions to process_transport():
+ *   1. check_anomalies() now returns alert_type_t — stored in `alert`.
+ *   2. build_record()    — static helper that populates a packet_record_t
+ *                          from the packet_info_t, flow_entry_t, and alert.
+ *   3. output_write()    — fans the record out to all enabled sinks.
+ *   4. output_format_timestamp() — called from build_record() to fill the
+ *                          timestamp string field.
  *
- *   parse_dispatch()       — validates Ethernet, filters IPv4
- *     └─ parse_ipv4()      — validates IP header, extracts src/dst IPs
- *          ├─ parse_tcp()  — extracts ports, flags, TCP payload pointer
- *          └─ parse_udp()  — extracts ports, UDP payload pointer
- *               └─ (both call) process_transport()
+ * The console print_flow() call is preserved at the end, after the file
+ * writes, so console output is unaffected by the new logging pipeline.
+ *
+ * Internal call chain:
+ *   parse_dispatch()
+ *     └─ parse_ipv4()
+ *          ├─ parse_tcp()
+ *          └─ parse_udp()
+ *               └─ process_transport()
  *                    ├─ flow_normalize_key()
- *                    ├─ flow_lookup_or_create()
- *                    ├─ updates syn_count / ack_count on flow entry
- *                    ├─ print_flow()
- *                    └─ check_anomalies()
- *
- * Byte order contract:
- *   IPs are converted from network to host byte order in parse_ipv4(),
- *   once. All downstream code (flow keys, hashing, comparison, printing)
- *   operates in host byte order. Only ip_to_str() converts back to network
- *   order when calling inet_ntop() for display.
- *
- *   Ports are converted in parse_tcp() / parse_udp() with ntohs().
- *
- * Bounds checking:
- *   Every pointer advance is guarded by a `remaining` check before the
- *   cast, preventing out-of-bounds reads on truncated or malformed packets.
+ *                    ├─ flow_lookup_or_create()   [update flow counters]
+ *                    ├─ update TCP flag counters
+ *                    ├─ check_anomalies()         → alert_type_t
+ *                    ├─ build_record()            → packet_record_t
+ *                    ├─ output_write()            → JSON / CSV files
+ *                    └─ print_flow()              → console
  */
 
 #include "parse.h"
 #include "flow.h"
 #include "analysis.h"
+#include "output.h"
 #include "utils.h"
 
 #include <string.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
 
-#include <netinet/if_ether.h>   /* struct ethhdr, ETH_P_IP              */
-#include <netinet/ip.h>         /* struct iphdr, IPPROTO_TCP/UDP        */
-#include <netinet/tcp.h>        /* struct tcphdr, TH_SYN, TH_ACK       */
-#include <netinet/udp.h>        /* struct udphdr                        */
-#include <arpa/inet.h>          /* ntohs(), ntohl()                     */
+/* ----------------------------------------------------------------
+ * build_record — populate a packet_record_t from all available sources.
+ *
+ * IPs are pulled from the normalised flow key (not the raw pkt) so the
+ * log record is consistent with the console FLOW output — the same
+ * canonical src/dst ordering appears in both.
+ *
+ * output_format_timestamp() is defined in output.c (not utils.c) because
+ * timestamp formatting is an output-layer concern using <time.h>.
+ * ---------------------------------------------------------------- */
+static void build_record(packet_record_t      *rec,
+                         const packet_info_t  *pkt,
+                         const flow_entry_t   *flow,
+                         alert_type_t          alert)
+{
+    /* Timestamp: format struct timeval into "2026-04-02T15:32:10.123Z" */
+    output_format_timestamp(&pkt->ts, rec->timestamp, sizeof(rec->timestamp));
+
+    /*
+     * Use flow key IPs (normalised, lower IP is src) rather than raw pkt IPs.
+     * This ensures every update to the same flow shows the same src/dst in logs.
+     */
+    ip_to_str(flow->key.src_ip, rec->src_ip, sizeof(rec->src_ip));
+    ip_to_str(flow->key.dst_ip, rec->dst_ip, sizeof(rec->dst_ip));
+
+    rec->src_port      = flow->key.src_port;
+    rec->dst_port      = flow->key.dst_port;
+    rec->proto         = pkt->proto;
+    rec->length        = pkt->pkt_len;
+    rec->packets_total = flow->total_packets;
+    rec->bytes_total   = flow->total_bytes;
+    rec->alert         = alert;
+}
 
 /* ----------------------------------------------------------------
  * process_transport — convergence point for TCP and UDP.
- *
- * Receives a fully-populated packet_info_t and:
- *   1. Builds a flow_key_t from the 5-tuple.
- *   2. Normalises the key (lower IP/port becomes src).
- *   3. Looks up or creates the flow entry; updates packet/byte counts.
- *   4. Updates TCP flag counters on the flow entry (Phase 3).
- *   5. Prints the current flow state.
- *   6. Dispatches to the anomaly detection engine.
  * ---------------------------------------------------------------- */
 static void process_transport(const packet_info_t *pkt,
-                              flow_table_t *flows,
-                              ip_table_t   *trackers)
+                              flow_table_t        *flows,
+                              ip_table_t          *trackers)
 {
-    /* Step 1 & 2: build and normalise the flow key */
+    /* Step 1: build and normalise the flow key */
     flow_key_t key;
-    memset(&key, 0, sizeof(key));   /* zero padding to keep hashing stable */
+    memset(&key, 0, sizeof(key));
     key.src_ip   = pkt->src_ip;
     key.dst_ip   = pkt->dst_ip;
     key.src_port = pkt->src_port;
@@ -65,30 +91,32 @@ static void process_transport(const packet_info_t *pkt,
     key.proto    = pkt->proto;
     flow_normalize_key(&key);
 
-    /* Step 3: lookup or create; updates total_packets, total_bytes, last_seen */
+    /* Step 2: update flow counters (or create new entry) */
     flow_entry_t *entry = flow_lookup_or_create(flows, &key, &pkt->ts, pkt->pkt_len);
-    if (entry == NULL) return;  /* malloc failure: drop this packet */
+    if (entry == NULL) return;
 
-    /* Step 4: update TCP flag counters on the flow entry */
+    /* Step 3: update per-flow TCP flag counters */
     if (pkt->proto == IPPROTO_TCP) {
         if (pkt->tcp_flags & TH_SYN) entry->syn_count++;
         if (pkt->tcp_flags & TH_ACK) entry->ack_count++;
     }
 
-    /* Step 5: log the updated flow to stdout */
-    print_flow(entry);
+    /* Step 4: run anomaly detection — returns highest-priority alert fired */
+    alert_type_t alert = check_anomalies(entry, pkt, trackers);
 
-    /* Step 6: run anomaly checks with the freshly-updated entry */
-    check_anomalies(entry, pkt, trackers);
+    /* Step 5: build the unified log record */
+    packet_record_t rec;
+    build_record(&rec, pkt, entry, alert);
+
+    /* Step 6: write to all enabled output sinks (JSON, CSV) */
+    output_write(&rec);
+
+    /* Step 7: console output — unchanged from Phase 3 */
+    print_flow(entry);
 }
 
 /* ----------------------------------------------------------------
- * parse_tcp — extract TCP fields into a packet_info_t.
- *
- * th_off (data offset) gives the TCP header length in 32-bit words.
- * Multiplied by 4 to get bytes. Valid range: 20–60 bytes.
- * transport_payload is set to the first byte of the TCP payload, making
- * it available to higher-level parsers (e.g. TLS/HTTP in a future phase).
+ * parse_tcp — extract TCP fields, compute payload pointer.
  * ---------------------------------------------------------------- */
 static void parse_tcp(const uint8_t *ptr, int remaining,
                       uint32_t src_ip, uint32_t dst_ip,
@@ -98,16 +126,8 @@ static void parse_tcp(const uint8_t *ptr, int remaining,
     if (remaining < MIN_TCP_HDR_LEN) return;
 
     const struct tcphdr *tcp = (const struct tcphdr *)ptr;
-
-    /*
-     * Compute the TCP header length from the data-offset field.
-     * Clamp to MIN_TCP_HDR_LEN on invalid values to avoid negative
-     * payload lengths; malformed packets are still flow-tracked.
-     */
     int hdrlen = tcp->th_off * 4;
-    if (hdrlen < MIN_TCP_HDR_LEN || hdrlen > remaining) {
-        hdrlen = MIN_TCP_HDR_LEN;
-    }
+    if (hdrlen < MIN_TCP_HDR_LEN || hdrlen > remaining) hdrlen = MIN_TCP_HDR_LEN;
 
     packet_info_t pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -126,11 +146,7 @@ static void parse_tcp(const uint8_t *ptr, int remaining,
 }
 
 /* ----------------------------------------------------------------
- * parse_udp — extract UDP fields into a packet_info_t.
- *
- * The UDP header is always exactly 8 bytes; no variable-length concern.
- * transport_payload points to the UDP payload, used by detect_dns_anomaly
- * to parse DNS query names.
+ * parse_udp — extract UDP fields, set payload pointer for DNS parsing.
  * ---------------------------------------------------------------- */
 static void parse_udp(const uint8_t *ptr, int remaining,
                       uint32_t src_ip, uint32_t dst_ip,
@@ -148,7 +164,7 @@ static void parse_udp(const uint8_t *ptr, int remaining,
     pkt.src_port              = ntohs(udp->uh_sport);
     pkt.dst_port              = ntohs(udp->uh_dport);
     pkt.proto                 = IPPROTO_UDP;
-    pkt.tcp_flags             = 0;       /* UDP has no flags */
+    pkt.tcp_flags             = 0;
     pkt.pkt_len               = pkt_len;
     pkt.ts                    = *ts;
     pkt.transport_payload     = ptr + MIN_UDP_HDR_LEN;
@@ -158,18 +174,7 @@ static void parse_udp(const uint8_t *ptr, int remaining,
 }
 
 /* ----------------------------------------------------------------
- * parse_ipv4 — validate IPv4 header and dispatch to TCP or UDP.
- *
- * ip->ihl (Internet Header Length) is in 32-bit words; multiplied by 4
- * for bytes. Valid range: 20–60 bytes (IHL 5–15). Values outside this
- * range indicate a malformed packet, which is silently dropped.
- *
- * IPs are converted from network to host byte order HERE, once.
- * All downstream code operates in host byte order.
- *
- * wirelen (passed as pkt_len) is the actual wire size, not caplen.
- * This ensures flow byte counters reflect real traffic volume even when
- * the snapshot length truncates the captured payload.
+ * parse_ipv4 — validate IP header, convert addresses, dispatch.
  * ---------------------------------------------------------------- */
 static void parse_ipv4(const uint8_t *ip_ptr, int remaining,
                        const struct timeval *ts, uint32_t wirelen,
@@ -178,11 +183,9 @@ static void parse_ipv4(const uint8_t *ip_ptr, int remaining,
     if (remaining < MIN_IP_HDR_LEN) return;
 
     const struct iphdr *ip = (const struct iphdr *)ip_ptr;
-
     int ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < MIN_IP_HDR_LEN || ip_hdr_len > remaining) return;
 
-    /* Convert to host byte order once */
     uint32_t src_ip = ntohl(ip->saddr);
     uint32_t dst_ip = ntohl(ip->daddr);
 
@@ -197,27 +200,19 @@ static void parse_ipv4(const uint8_t *ip_ptr, int remaining,
             parse_udp(tp, tr, src_ip, dst_ip, ts, wirelen, flows, trackers);
             break;
         default:
-            break;  /* ICMP, IGMP, etc. — silently ignored */
+            break;
     }
 }
 
 /* ----------------------------------------------------------------
- * parse_dispatch — public entry point; validates Ethernet and filters IPv4.
- *
- * The struct ethhdr cast is safe because:
- *   (a) we validated caplen >= MIN_ETHER_LEN (14 bytes) before the cast.
- *   (b) the buffer is aligned by libpcap.
- *   (c) x86/x86-64 handles any misalignment in hardware.
- *
- * ETH_P_IP (0x0800) is compared AFTER ntohs() because h_proto is in
- * network byte order (big-endian) on the wire.
+ * parse_dispatch — public entry point; validates Ethernet, filters IPv4.
  * ---------------------------------------------------------------- */
-void parse_dispatch(const uint8_t    *packet,
-                    int               caplen,
-                    uint32_t          wirelen,
+void parse_dispatch(const uint8_t       *packet,
+                    int                  caplen,
+                    uint32_t             wirelen,
                     const struct timeval *ts,
-                    flow_table_t     *flows,
-                    ip_table_t       *trackers)
+                    flow_table_t        *flows,
+                    ip_table_t          *trackers)
 {
     if (caplen < MIN_ETHER_LEN) return;
 

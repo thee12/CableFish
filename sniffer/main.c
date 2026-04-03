@@ -1,28 +1,30 @@
 /*
- * main.c — Program entry point
+ * main.c — Program entry point (Phase 4: Structured Logging)
  *
- * Responsibilities:
- *   1. Declare and initialise the two shared state tables:
- *        flow_table_t  g_flows    — bidirectional flow tracking (flow.c)
- *        ip_table_t    g_trackers — per-IP anomaly state    (analysis.c)
- *   2. Resolve the capture interface (from argv or pcap_lookupdev).
- *   3. Print the active configuration to stdout.
- *   4. Install SIGINT/SIGTERM signal handlers.
- *   5. Open the capture handle (capture.c).
- *   6. Run the blocking capture loop (capture.c).
- *   7. On exit: print flow summary, libpcap stats, free all heap memory.
+ * Phase 4 additions:
+ *   - Parses three optional command-line flags:
+ *       --json              enable JSON output  (packets.json)
+ *       --csv               enable CSV output   (packets.csv)
+ *       --output-dir <path> directory for output files (default: ".")
  *
- * main.c has NO packet-processing logic.  All of that lives in:
- *   parse.c    → protocol layer dissection
- *   flow.c     → flow table management
- *   analysis.c → anomaly detection
- *   utils.c    → formatting helpers
- *   capture.c  → libpcap I/O
+ *   - If neither --json nor --csv is given, BOTH are enabled by default
+ *     so the sniffer produces file output out of the box.
  *
- * Data flow:
- *   libpcap → capture.c → parse.c → flow.c  → (stats)
- *                                 → analysis.c → (alerts)
- *                                 → utils.c    → (stdout)
+ *   - Calls output_init() before the capture loop and output_close()
+ *     after, ensuring all file handles are properly opened and flushed.
+ *
+ * Argument parsing rules:
+ *   - Flags may appear in any order.
+ *   - The first non-flag argument (not starting with '-') is treated as
+ *     the interface name, preserving backward compatibility.
+ *   - Unknown flags are silently ignored (forward compatibility).
+ *
+ * Full invocation examples:
+ *   sudo ./sniffer
+ *   sudo ./sniffer eth0
+ *   sudo ./sniffer --json --csv eth0
+ *   sudo ./sniffer --csv --output-dir /var/log/sniffer eth0
+ *   sudo ./sniffer --json --output-dir /tmp
  */
 
 #include <stdio.h>
@@ -31,25 +33,89 @@
 #include <signal.h>
 #include <inttypes.h>
 
-#include <pcap.h>   /* PCAP_ERRBUF_SIZE, pcap_lookupdev, pcap_geterr */
+#include <pcap.h>
 
 #include "types.h"
 #include "capture.h"
 #include "flow.h"
 #include "analysis.h"
+#include "output.h"
 #include "utils.h"
 
+/* ----------------------------------------------------------------
+ * parse_args — extract interface name and output flags from argv.
+ *
+ * Modifies `dev` to point to the interface name argument (or NULL if
+ * not provided). Fills `out_cfg` from recognised flags.
+ * ---------------------------------------------------------------- */
+static void parse_args(int argc, char *argv[],
+                       const char **dev,
+                       output_config_t *out_cfg)
+{
+    int json_explicit = 0;
+    int csv_explicit  = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0) {
+            json_explicit = 1;
+
+        } else if (strcmp(argv[i], "--csv") == 0) {
+            csv_explicit = 1;
+
+        } else if (strcmp(argv[i], "--output-dir") == 0) {
+            if (i + 1 < argc) {
+                /*
+                 * Copy into the fixed-size buffer with snprintf to prevent
+                 * overflow. The -1 ensures NUL termination even when the
+                 * path is exactly 255 characters long.
+                 */
+                snprintf(out_cfg->output_dir,
+                         sizeof(out_cfg->output_dir) - 1,
+                         "%s", argv[++i]);
+            } else {
+                fprintf(stderr, "Warning: --output-dir requires a path argument\n");
+            }
+
+        } else if (argv[i][0] != '-' && *dev == NULL) {
+            /* First non-flag argument is the interface name */
+            *dev = argv[i];
+
+        }
+        /* Unknown flags are silently skipped for forward compatibility */
+    }
+
+    /*
+     * Default behaviour: if the user gave no output flags, enable both.
+     * If any flag was explicitly given, respect only those flags.
+     */
+    if (!json_explicit && !csv_explicit) {
+        out_cfg->json_enabled = 1;
+        out_cfg->csv_enabled  = 1;
+    } else {
+        out_cfg->json_enabled = json_explicit;
+        out_cfg->csv_enabled  = csv_explicit;
+    }
+}
+
+/* ----------------------------------------------------------------
+ * main
+ * ---------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
     char errbuf[PCAP_ERRBUF_SIZE];
     const char *dev = NULL;
 
     /* ------------------------------------------------------------------
-     * 1. Initialise state tables
-     *
-     * Both tables are stack-allocated in main() and passed by pointer to
-     * every function that needs them. This keeps global state to a minimum
-     * (only g_handle in capture.c is a true global).
+     * 1. Initialise output config with safe defaults, then parse CLI args
+     * ------------------------------------------------------------------ */
+    output_config_t out_cfg;
+    memset(&out_cfg, 0, sizeof(out_cfg));
+    strncpy(out_cfg.output_dir, ".", sizeof(out_cfg.output_dir) - 1);
+
+    parse_args(argc, argv, &dev, &out_cfg);
+
+    /* ------------------------------------------------------------------
+     * 2. Initialise state tables
      * ------------------------------------------------------------------ */
     flow_table_t g_flows;
     ip_table_t   g_trackers;
@@ -58,56 +124,47 @@ int main(int argc, char *argv[])
     analysis_init(&g_trackers);
 
     /* ------------------------------------------------------------------
-     * 2. Resolve capture interface
-     *
-     * pcap_lookupdev is deprecated in newer libpcap but remains the most
-     * portable single-call solution for automatic selection. The pragma
-     * suppresses the deprecation warning without modifying the code.
+     * 3. Resolve capture interface if not given via CLI
      * ------------------------------------------------------------------ */
-    if (argc >= 2) {
-        dev = argv[1];
-    } else {
+    if (dev == NULL) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         dev = pcap_lookupdev(errbuf);
 #pragma GCC diagnostic pop
-
         if (dev == NULL) {
-            fprintf(stderr, "Error: could not find a capture interface: %s\n",
-                    errbuf);
+            fprintf(stderr, "Error: no capture interface found: %s\n", errbuf);
             fprintf(stderr,
-                    "Hint: run with sudo, or specify an interface: "
-                    "./sniffer eth0\n");
+                    "Hint: run with sudo, or specify: ./sniffer [--json] [--csv] "
+                    "[--output-dir PATH] INTERFACE\n");
             return EXIT_FAILURE;
         }
     }
 
     /* ------------------------------------------------------------------
-     * 3. Print active configuration
+     * 4. Print active configuration
      * ------------------------------------------------------------------ */
-    printf("=== Packet Sniffer — Phase 3 (Modular) ===\n");
-    printf("Interface         : %s\n",   dev);
-    printf("Flow timeout      : %.0fs\n", FLOW_TIMEOUT_SECS);
-    printf("SYN scan          : %d SYNs / %.0fs window\n",
+    printf("=== Packet Sniffer -- Phase 4 (Structured Logging) ===\n");
+    printf("Interface       : %s\n",   dev);
+    printf("JSON output     : %s\n",   out_cfg.json_enabled ? "enabled" : "disabled");
+    printf("CSV  output     : %s\n",   out_cfg.csv_enabled  ? "enabled" : "disabled");
+    printf("Output dir      : %s\n",   out_cfg.output_dir);
+    printf("Flow timeout    : %.0fs\n", FLOW_TIMEOUT_SECS);
+    printf("SYN scan        : %d SYNs / %.0fs\n",
            THRESH_SYN_COUNT, THRESH_SYN_WINDOW_SECS);
-    printf("DNS name length   : > %d chars\n", THRESH_DNS_NAME_LEN);
-    printf("DNS frequency     : > %d queries / %.0fs window\n",
+    printf("DNS name len    : > %d chars\n", THRESH_DNS_NAME_LEN);
+    printf("DNS frequency   : > %d / %.0fs\n",
            THRESH_DNS_FREQ_COUNT, THRESH_DNS_WINDOW_SECS);
-    printf("High traffic      : > %" PRIu64 " bytes per flow\n",
-           (uint64_t)THRESH_HIGH_BYTES);
-    printf("Alert cooldown    : %.0fs\n", ALERT_COOLDOWN_SECS);
-    printf("Press Ctrl+C to stop and print summary.\n\n");
+    printf("High traffic    : > %" PRIu64 " bytes\n", (uint64_t)THRESH_HIGH_BYTES);
+    printf("Alert cooldown  : %.0fs\n", ALERT_COOLDOWN_SECS);
+    printf("Press Ctrl+C to stop.\n\n");
 
     /* ------------------------------------------------------------------
-     * 4. Install signal handlers
-     *
-     * sigaction() is preferred over signal() for well-defined behaviour:
-     *   - sa_flags = 0: interrupted system calls are NOT automatically
-     *     restarted (pcap_loop uses select() internally; we want it to
-     *     notice the break).
-     *   - sigemptyset: no additional signals blocked during the handler.
-     *
-     * capture_signal_handler only calls pcap_breakloop() — async-signal-safe.
+     * 5. Initialise output pipeline — opens files, writes CSV header
+     * ------------------------------------------------------------------ */
+    output_init(&out_cfg);
+
+    /* ------------------------------------------------------------------
+     * 6. Install signal handlers
      * ------------------------------------------------------------------ */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -118,23 +175,21 @@ int main(int argc, char *argv[])
     if (sigaction(SIGINT,  &sa, NULL) == -1 ||
         sigaction(SIGTERM, &sa, NULL) == -1) {
         perror("sigaction");
+        output_close();
         return EXIT_FAILURE;
     }
 
     /* ------------------------------------------------------------------
-     * 5. Open capture handle
+     * 7. Open capture handle
      * ------------------------------------------------------------------ */
     pcap_t *handle = capture_open(dev, errbuf);
     if (handle == NULL) {
+        output_close();
         return EXIT_FAILURE;
     }
 
     /* ------------------------------------------------------------------
-     * 6. Blocking capture loop
-     *
-     * Returns when:
-     *   rc == -2 — pcap_breakloop() was called via SIGINT/SIGTERM (normal)
-     *   rc == -1 — a libpcap capture error occurred
+     * 8. Blocking capture loop
      * ------------------------------------------------------------------ */
     int rc = capture_run(handle, &g_flows, &g_trackers);
 
@@ -145,7 +200,13 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------
-     * 7. Cleanup: summary → stats → free memory
+     * 9. Flush and close output files before printing the summary so
+     *    that all data is on disk before we exit.
+     * ------------------------------------------------------------------ */
+    output_close();
+
+    /* ------------------------------------------------------------------
+     * 10. Print flow summary and libpcap stats, then free all memory
      * ------------------------------------------------------------------ */
     flow_print_summary(&g_flows);
     capture_print_stats(handle);

@@ -1,93 +1,136 @@
 /*
  * types.h — Shared type definitions and compile-time constants
  *
- * This header is the single source of truth for every struct and threshold
- * used across the project. No module defines its own structs for shared data.
+ * Single source of truth for every struct, enum, and threshold used across
+ * the project. Include this before any other project header.
  *
- * Include order:  types.h must be included before any other project header.
+ * Phase 4 additions:
+ *   alert_type_t    — enum of detectable anomaly categories
+ *   packet_record_t — unified struct representing one loggable event,
+ *                     passed from parse.c → output.c
+ *   output_config_t — CLI-configurable output settings passed to output_init()
  *
- * Data flow overview:
- *   capture.c  → receives raw frames from libpcap
- *   parse.c    → fills packet_info_t from raw bytes
- *   flow.c     → manages flow_table_t keyed by flow_key_t
- *   analysis.c → manages ip_table_t; reads packet_info_t and flow_entry_t
- *   utils.c    → formatting helpers used by all modules
+ * Data flow:
+ *   capture.c → parse.c → flow.c      (flow tracking)
+ *                       → analysis.c  (anomaly detection, returns alert_type_t)
+ *                       → output.c    (writes packet_record_t to JSON / CSV)
  */
 
 #ifndef TYPES_H
 #define TYPES_H
 
 #include <stdint.h>
-#include <sys/time.h>   /* struct timeval */
+#include <sys/time.h>
+#include <arpa/inet.h>   /* INET_ADDRSTRLEN */
 
 /* ============================================================
  * Compile-time tunable thresholds
- * All values in one place — change here, recompile, done.
  * ============================================================ */
 
-/* --- libpcap capture --------------------------------------- */
-#define SNAPLEN                 65535   /* max bytes captured per packet    */
-#define PCAP_TIMEOUT_MS         1000    /* read timeout passed to pcap      */
+#define SNAPLEN                 65535
+#define PCAP_TIMEOUT_MS         1000
 
-/* --- Flow hash table --------------------------------------- */
-#define FLOW_TABLE_SIZE         1024    /* bucket count (must be power of 2) */
+#define FLOW_TABLE_SIZE         1024
 #define FLOW_TABLE_MASK         (FLOW_TABLE_SIZE - 1)
-#define FLOW_TIMEOUT_SECS       60.0    /* idle flow expiry in seconds       */
+#define FLOW_TIMEOUT_SECS       60.0
 
-/* --- Per-IP tracker table ---------------------------------- */
-#define IP_TABLE_SIZE           512     /* bucket count (must be power of 2) */
+#define IP_TABLE_SIZE           512
 #define IP_TABLE_MASK           (IP_TABLE_SIZE - 1)
 
-/* --- SYN scan detection ------------------------------------ */
-#define THRESH_SYN_COUNT        10      /* SYNs from one IP before alert    */
-#define THRESH_SYN_WINDOW_SECS  10.0   /* sliding window duration (seconds) */
+#define THRESH_SYN_COUNT        10
+#define THRESH_SYN_WINDOW_SECS  10.0
 
-/* --- DNS anomaly detection --------------------------------- */
-#define THRESH_DNS_NAME_LEN     50      /* max acceptable domain name length */
-#define THRESH_DNS_FREQ_COUNT   20      /* max DNS queries per window        */
-#define THRESH_DNS_WINDOW_SECS  10.0   /* sliding window duration (seconds) */
+#define THRESH_DNS_NAME_LEN     50
+#define THRESH_DNS_FREQ_COUNT   20
+#define THRESH_DNS_WINDOW_SECS  10.0
 #define DNS_PORT                53
 
-/* --- High traffic detection -------------------------------- */
-#define THRESH_HIGH_BYTES       (1024ULL * 1024ULL)  /* 1 MB per flow       */
+#define THRESH_HIGH_BYTES       (1024ULL * 1024ULL)
 
-/* --- Alert spam prevention --------------------------------- */
-#define ALERT_COOLDOWN_SECS     10.0   /* minimum gap between same alert    */
+#define ALERT_COOLDOWN_SECS     10.0
 
-/* --- Header minimum sizes (bytes) -------------------------- */
-#define MIN_ETHER_LEN           14      /* Ethernet II: 6+6+2               */
-#define MIN_IP_HDR_LEN          20      /* IPv4 without options              */
-#define MIN_TCP_HDR_LEN         20      /* TCP without options               */
-#define MIN_UDP_HDR_LEN         8       /* UDP fixed header                  */
-#define MIN_DNS_HDR_LEN         12      /* DNS fixed header (RFC 1035)       */
+#define MIN_ETHER_LEN           14
+#define MIN_IP_HDR_LEN          20
+#define MIN_TCP_HDR_LEN         20
+#define MIN_UDP_HDR_LEN         8
+#define MIN_DNS_HDR_LEN         12
 
 /* ============================================================
- * packet_info_t
+ * alert_type_t  [Phase 4]
  *
- * All metadata extracted from a single captured packet.
- * Populated once in parse.c and passed by pointer through the call chain.
- * transport_payload points into the libpcap buffer — valid only for the
- * duration of the packet_handler callback.
+ * Categorises the anomaly (if any) detected on a given packet.
+ * check_anomalies() in analysis.c returns one of these values.
+ * ALERT_NONE is the common case (no anomaly detected).
+ *
+ * Priority when multiple detectors fire simultaneously:
+ *   HIGH_TRAFFIC > SYN_SCAN > DNS_ANOMALY_FREQ > DNS_ANOMALY_LONG
+ * (check_anomalies returns the first non-NONE value it encounters)
+ * ============================================================ */
+typedef enum {
+    ALERT_NONE            = 0,
+    ALERT_SYN_SCAN        = 1,
+    ALERT_DNS_ANOMALY_LONG= 2,
+    ALERT_DNS_ANOMALY_FREQ= 3,
+    ALERT_HIGH_TRAFFIC    = 4
+} alert_type_t;
+
+/* ============================================================
+ * packet_record_t  [Phase 4]
+ *
+ * A fully-resolved, human-readable snapshot of one packet/flow event.
+ * Populated in parse.c after all layers have been processed, then passed
+ * to output_write() which fans it out to every enabled output target.
+ *
+ * Fields are pre-formatted (IP strings, timestamp string) so that
+ * output.c performs no further parsing — just writing.
+ *
+ * packets_total / bytes_total are taken from the flow entry;
+ * they are 0 for a packet that could not be associated with a flow.
  * ============================================================ */
 typedef struct {
-    uint32_t        src_ip;               /* source IP, host byte order      */
-    uint32_t        dst_ip;               /* destination IP, host byte order */
-    uint16_t        src_port;             /* source port, host byte order    */
-    uint16_t        dst_port;             /* destination port, host byte order*/
-    uint8_t         proto;                /* IPPROTO_TCP or IPPROTO_UDP      */
-    uint8_t         tcp_flags;            /* raw TCP flags byte              */
-    uint32_t        pkt_len;              /* wire length in bytes            */
-    struct timeval  ts;                   /* libpcap capture timestamp       */
-    const uint8_t  *transport_payload;    /* bytes after transport header    */
+    char        timestamp[32];          /* "2026-04-02T15:32:10.123Z"         */
+    char        src_ip[INET_ADDRSTRLEN];
+    char        dst_ip[INET_ADDRSTRLEN];
+    uint16_t    src_port;
+    uint16_t    dst_port;
+    uint8_t     proto;                  /* IPPROTO_TCP or IPPROTO_UDP         */
+    uint32_t    length;                 /* wire length of this packet (bytes) */
+    uint64_t    packets_total;          /* total packets on this flow so far  */
+    uint64_t    bytes_total;            /* total bytes on this flow so far    */
+    alert_type_t alert;                 /* anomaly detected on this packet    */
+} packet_record_t;
+
+/* ============================================================
+ * output_config_t  [Phase 4]
+ *
+ * Populated from CLI arguments in main() and passed to output_init().
+ * output.c copies this into its internal state so callers need not
+ * keep the struct alive after output_init() returns.
+ * ============================================================ */
+typedef struct {
+    int  json_enabled;          /* 1 = write packets.json    */
+    int  csv_enabled;           /* 1 = write packets.csv     */
+    char output_dir[256];       /* directory for output files */
+} output_config_t;
+
+/* ============================================================
+ * packet_info_t — parsed metadata for one captured packet
+ * ============================================================ */
+typedef struct {
+    uint32_t        src_ip;
+    uint32_t        dst_ip;
+    uint16_t        src_port;
+    uint16_t        dst_port;
+    uint8_t         proto;
+    uint8_t         tcp_flags;
+    uint32_t        pkt_len;
+    struct timeval  ts;
+    const uint8_t  *transport_payload;
     int             transport_payload_len;
 } packet_info_t;
 
 /* ============================================================
- * flow_key_t
- *
- * The normalised 5-tuple that uniquely identifies a bidirectional flow.
- * All fields stored in host byte order after normalisation.
- * Normalisation rule: lower IP (or lower port on tie) is always src.
+ * flow_key_t — normalised 5-tuple
  * ============================================================ */
 typedef struct {
     uint32_t src_ip;
@@ -98,21 +141,18 @@ typedef struct {
 } flow_key_t;
 
 /* ============================================================
- * flow_entry_t
- *
- * One node in the flow table's separate-chaining linked list.
- * Phase 3 additions: syn_count, ack_count, last_alert_time.
+ * flow_entry_t — per-flow state in the hash table
  * ============================================================ */
 typedef struct flow_entry {
-    flow_key_t        key;            /* normalised 5-tuple                 */
-    uint64_t          total_packets;  /* packets in both directions         */
-    uint64_t          total_bytes;    /* bytes in both directions           */
-    struct timeval    start_time;     /* timestamp of first packet          */
-    struct timeval    last_seen;      /* timestamp of most recent packet    */
-    uint32_t          syn_count;      /* TCP SYN packets on this flow       */
-    uint32_t          ack_count;      /* TCP ACK packets on this flow       */
-    struct timeval    last_alert_time;/* for HIGH_TRAFFIC cooldown          */
-    struct flow_entry *next;          /* next entry in bucket chain         */
+    flow_key_t        key;
+    uint64_t          total_packets;
+    uint64_t          total_bytes;
+    struct timeval    start_time;
+    struct timeval    last_seen;
+    uint32_t          syn_count;
+    uint32_t          ack_count;
+    struct timeval    last_alert_time;
+    struct flow_entry *next;
 } flow_entry_t;
 
 /* ============================================================
@@ -124,24 +164,16 @@ typedef struct {
 } flow_table_t;
 
 /* ============================================================
- * ip_tracker_t
- *
- * Per-source-IP state for cross-flow anomaly detection.
- * SYN scans and DNS floods are per-IP phenomena — they span many flows.
+ * ip_tracker_t — per-source-IP state for anomaly detection
  * ============================================================ */
 typedef struct ip_tracker {
-    uint32_t          ip;                /* source IP, host byte order      */
-
-    /* SYN scan tracking */
-    uint32_t          syn_count;         /* SYNs in current sliding window  */
-    struct timeval    syn_window_start;  /* when the current window opened  */
-    struct timeval    last_syn_alert;    /* timestamp of last SYN_SCAN alert*/
-
-    /* DNS frequency tracking */
-    uint32_t          dns_count;         /* DNS queries in current window   */
-    struct timeval    dns_window_start;  /* when the current window opened  */
-    struct timeval    last_dns_alert;    /* timestamp of last DNS alert     */
-
+    uint32_t          ip;
+    uint32_t          syn_count;
+    struct timeval    syn_window_start;
+    struct timeval    last_syn_alert;
+    uint32_t          dns_count;
+    struct timeval    dns_window_start;
+    struct timeval    last_dns_alert;
     struct ip_tracker *next;
 } ip_tracker_t;
 

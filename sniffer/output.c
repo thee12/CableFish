@@ -24,6 +24,7 @@
  */
 
 #include "output.h"
+#include "ipc.h"
 #include "utils.h"
 
 #include <stdio.h>
@@ -76,24 +77,6 @@ static void format_timestamp(const struct timeval *tv, char *buf, size_t buflen)
 
     /* Append milliseconds and UTC suffix: ".123Z" */
     snprintf(buf, buflen, "%s.%03ldZ", base, (long)(tv->tv_usec / 1000));
-}
-
-/* ============================================================
- * Internal: alert_type_name
- *
- * Maps an alert_type_t enum value to its fixed string representation.
- * These strings appear verbatim in the JSON "alert" field and the
- * CSV alert column.
- * ============================================================ */
-static const char *alert_type_name(alert_type_t alert)
-{
-    switch (alert) {
-        case ALERT_SYN_SCAN:         return "SYN_SCAN";
-        case ALERT_DNS_ANOMALY_LONG: return "DNS_ANOMALY_LONG";
-        case ALERT_DNS_ANOMALY_FREQ: return "DNS_ANOMALY_FREQ";
-        case ALERT_HIGH_TRAFFIC:     return "HIGH_TRAFFIC";
-        default:                     return "NONE";
-    }
 }
 
 /* ============================================================
@@ -250,14 +233,17 @@ void output_init(const output_config_t *cfg)
 void output_write(const packet_record_t *rec)
 {
     /*
-     * packet_record_t was populated by parse.c with a raw struct timeval.
-     * We store the timeval separately and format it into the timestamp
-     * char array here. But since packet_record_t stores a pre-filled
-     * timestamp string (set in parse.c via format_timestamp there),
-     * we just write it directly.
+     * Fan the record out to every enabled sink.
+     * Each sink is independent — a failure in one does not affect the others.
+     *
+     * Sink order:
+     *   1. JSON file   (log_json)     — append to packets.json
+     *   2. CSV  file   (log_csv)      — append to packets.csv
+     *   3. IPC stream  (ipc_send_record) — send to backend over UNIX socket [Phase 5]
      */
     if (g_out.cfg.json_enabled) log_json(rec);
     if (g_out.cfg.csv_enabled)  log_csv(rec);
+    if (g_out.cfg.ipc_enabled)  ipc_send_record(rec);
 }
 
 void output_close(void)

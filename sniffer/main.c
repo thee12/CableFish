@@ -1,30 +1,23 @@
 /*
- * main.c — Program entry point (Phase 4: Structured Logging)
+ * main.c — Program entry point (Phase 5: WebSocket Streaming Backend)
  *
- * Phase 4 additions:
- *   - Parses three optional command-line flags:
- *       --json              enable JSON output  (packets.json)
- *       --csv               enable CSV output   (packets.csv)
- *       --output-dir <path> directory for output files (default: ".")
+ * Phase 4 flags (unchanged):
+ *   --json              enable JSON file output  (packets.json)
+ *   --csv               enable CSV  file output  (packets.csv)
+ *   --output-dir <path> directory for output files (default: ".")
  *
- *   - If neither --json nor --csv is given, BOTH are enabled by default
- *     so the sniffer produces file output out of the box.
+ * Phase 5 flags (new):
+ *   --stream            enable real-time IPC streaming to the Node.js backend
+ *   --backend-path <p>  UNIX socket path (default: /tmp/sniffer.sock)
  *
- *   - Calls output_init() before the capture loop and output_close()
- *     after, ensuring all file handles are properly opened and flushed.
- *
- * Argument parsing rules:
- *   - Flags may appear in any order.
- *   - The first non-flag argument (not starting with '-') is treated as
- *     the interface name, preserving backward compatibility.
- *   - Unknown flags are silently ignored (forward compatibility).
+ * --stream is opt-in. If not specified, file sinks behave as in Phase 4.
+ * If --stream is given without --backend-path, the default socket path is used.
  *
  * Full invocation examples:
  *   sudo ./sniffer
- *   sudo ./sniffer eth0
- *   sudo ./sniffer --json --csv eth0
- *   sudo ./sniffer --csv --output-dir /var/log/sniffer eth0
- *   sudo ./sniffer --json --output-dir /tmp
+ *   sudo ./sniffer --stream eth0
+ *   sudo ./sniffer --stream --backend-path /tmp/sniffer.sock eth0
+ *   sudo ./sniffer --json --csv --stream --output-dir /var/log eth0
  */
 
 #include <stdio.h>
@@ -40,13 +33,11 @@
 #include "flow.h"
 #include "analysis.h"
 #include "output.h"
+#include "ipc.h"
 #include "utils.h"
 
 /* ----------------------------------------------------------------
- * parse_args — extract interface name and output flags from argv.
- *
- * Modifies `dev` to point to the interface name argument (or NULL if
- * not provided). Fills `out_cfg` from recognised flags.
+ * parse_args — extract interface name and output/IPC flags from argv.
  * ---------------------------------------------------------------- */
 static void parse_args(int argc, char *argv[],
                        const char **dev,
@@ -64,29 +55,35 @@ static void parse_args(int argc, char *argv[],
 
         } else if (strcmp(argv[i], "--output-dir") == 0) {
             if (i + 1 < argc) {
-                /*
-                 * Copy into the fixed-size buffer with snprintf to prevent
-                 * overflow. The -1 ensures NUL termination even when the
-                 * path is exactly 255 characters long.
-                 */
                 snprintf(out_cfg->output_dir,
                          sizeof(out_cfg->output_dir) - 1,
                          "%s", argv[++i]);
             } else {
-                fprintf(stderr, "Warning: --output-dir requires a path argument\n");
+                fprintf(stderr, "Warning: --output-dir requires a path\n");
+            }
+
+        } else if (strcmp(argv[i], "--stream") == 0) {
+            /* Phase 5: enable real-time IPC streaming to the Node.js backend */
+            out_cfg->ipc_enabled = 1;
+
+        } else if (strcmp(argv[i], "--backend-path") == 0) {
+            /* Phase 5: override the UNIX socket path (default /tmp/sniffer.sock) */
+            if (i + 1 < argc) {
+                snprintf(out_cfg->ipc_socket_path,
+                         sizeof(out_cfg->ipc_socket_path) - 1,
+                         "%s", argv[++i]);
+            } else {
+                fprintf(stderr, "Warning: --backend-path requires a path\n");
             }
 
         } else if (argv[i][0] != '-' && *dev == NULL) {
-            /* First non-flag argument is the interface name */
             *dev = argv[i];
-
         }
-        /* Unknown flags are silently skipped for forward compatibility */
     }
 
     /*
-     * Default behaviour: if the user gave no output flags, enable both.
-     * If any flag was explicitly given, respect only those flags.
+     * Default file-sink behaviour (unchanged from Phase 4):
+     * if neither --json nor --csv is given, enable both.
      */
     if (!json_explicit && !csv_explicit) {
         out_cfg->json_enabled = 1;
@@ -110,7 +107,8 @@ int main(int argc, char *argv[])
      * ------------------------------------------------------------------ */
     output_config_t out_cfg;
     memset(&out_cfg, 0, sizeof(out_cfg));
-    strncpy(out_cfg.output_dir, ".", sizeof(out_cfg.output_dir) - 1);
+    strncpy(out_cfg.output_dir,     ".",                    sizeof(out_cfg.output_dir) - 1);
+    strncpy(out_cfg.ipc_socket_path, IPC_DEFAULT_SOCKET_PATH, sizeof(out_cfg.ipc_socket_path) - 1);
 
     parse_args(argc, argv, &dev, &out_cfg);
 
@@ -134,8 +132,8 @@ int main(int argc, char *argv[])
         if (dev == NULL) {
             fprintf(stderr, "Error: no capture interface found: %s\n", errbuf);
             fprintf(stderr,
-                    "Hint: run with sudo, or specify: ./sniffer [--json] [--csv] "
-                    "[--output-dir PATH] INTERFACE\n");
+                    "Usage: ./sniffer [--json] [--csv] [--output-dir DIR]\n"
+                    "                 [--stream] [--backend-path PATH] [IFACE]\n");
             return EXIT_FAILURE;
         }
     }
@@ -143,15 +141,18 @@ int main(int argc, char *argv[])
     /* ------------------------------------------------------------------
      * 4. Print active configuration
      * ------------------------------------------------------------------ */
-    printf("=== Packet Sniffer -- Phase 4 (Structured Logging) ===\n");
+    printf("=== Packet Sniffer -- Phase 5 (WebSocket Streaming) ===\n");
     printf("Interface       : %s\n",   dev);
     printf("JSON output     : %s\n",   out_cfg.json_enabled ? "enabled" : "disabled");
     printf("CSV  output     : %s\n",   out_cfg.csv_enabled  ? "enabled" : "disabled");
     printf("Output dir      : %s\n",   out_cfg.output_dir);
+    printf("IPC streaming   : %s\n",   out_cfg.ipc_enabled  ? "enabled" : "disabled");
+    if (out_cfg.ipc_enabled)
+        printf("Backend socket  : %s\n", out_cfg.ipc_socket_path);
     printf("Flow timeout    : %.0fs\n", FLOW_TIMEOUT_SECS);
     printf("SYN scan        : %d SYNs / %.0fs\n",
            THRESH_SYN_COUNT, THRESH_SYN_WINDOW_SECS);
-    printf("DNS name len    : > %d chars\n", THRESH_DNS_NAME_LEN);
+    printf("DNS name len    : > %d chars\n",   THRESH_DNS_NAME_LEN);
     printf("DNS frequency   : > %d / %.0fs\n",
            THRESH_DNS_FREQ_COUNT, THRESH_DNS_WINDOW_SECS);
     printf("High traffic    : > %" PRIu64 " bytes\n", (uint64_t)THRESH_HIGH_BYTES);
@@ -159,9 +160,13 @@ int main(int argc, char *argv[])
     printf("Press Ctrl+C to stop.\n\n");
 
     /* ------------------------------------------------------------------
-     * 5. Initialise output pipeline — opens files, writes CSV header
+     * 5. Initialise output pipeline (files) and IPC stream [Phase 5]
      * ------------------------------------------------------------------ */
     output_init(&out_cfg);
+
+    if (out_cfg.ipc_enabled) {
+        ipc_init(out_cfg.ipc_socket_path);   /* non-fatal if backend is down */
+    }
 
     /* ------------------------------------------------------------------
      * 6. Install signal handlers
@@ -175,6 +180,7 @@ int main(int argc, char *argv[])
     if (sigaction(SIGINT,  &sa, NULL) == -1 ||
         sigaction(SIGTERM, &sa, NULL) == -1) {
         perror("sigaction");
+        ipc_close();
         output_close();
         return EXIT_FAILURE;
     }
@@ -184,6 +190,7 @@ int main(int argc, char *argv[])
      * ------------------------------------------------------------------ */
     pcap_t *handle = capture_open(dev, errbuf);
     if (handle == NULL) {
+        ipc_close();
         output_close();
         return EXIT_FAILURE;
     }
@@ -200,13 +207,13 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------
-     * 9. Flush and close output files before printing the summary so
-     *    that all data is on disk before we exit.
+     * 9. Flush / close all outputs before the exit summary
      * ------------------------------------------------------------------ */
+    ipc_close();
     output_close();
 
     /* ------------------------------------------------------------------
-     * 10. Print flow summary and libpcap stats, then free all memory
+     * 10. Print flow summary, libpcap stats, free all memory
      * ------------------------------------------------------------------ */
     flow_print_summary(&g_flows);
     capture_print_stats(handle);
